@@ -1,6 +1,6 @@
 """
-Servidor Webhook Telegram → ClickUp
-Roda 24/7 no Render.com
+Servidor Webhook Telegram → Claude (IA) → ClickUp
+Com Transcrição Inteligente de Áudio
 """
 
 import os
@@ -8,6 +8,8 @@ import json
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
+import base64
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -21,6 +23,14 @@ CLICKUP_WORKSPACE_ID = "9011864477"
 CLICKUP_LIST_ID = "901113530854"
 CLICKUP_API = "https://api.clickup.com/api/v2"
 
+# Claude API
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+
+# OpenAI (para Whisper)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
+
 # Webhook URL
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
 
@@ -31,7 +41,7 @@ def health():
     """Verificar se o servidor está vivo"""
     return jsonify({
         "status": "🟢 OK",
-        "service": "Telegram → ClickUp Automation",
+        "service": "Telegram → Claude → ClickUp (Com IA Avançada)",
         "timestamp": datetime.now().isoformat(),
         "webhook_url": f"{WEBHOOK_URL}/webhook"
     })
@@ -42,10 +52,7 @@ def webhook():
     try:
         data = request.get_json()
         
-        if not data:
-            return jsonify({"ok": True})
-        
-        if "message" not in data:
+        if not data or "message" not in data:
             return jsonify({"ok": True})
         
         message = data["message"]
@@ -61,30 +68,55 @@ def webhook():
         if "text" in message:
             texto = message["text"]
             print(f"📝 [{user_name}] Texto: {texto}")
-            task_data = parse_message(texto)
+            
+            # Processa texto com Claude para melhor compreensão
+            task_data = process_with_claude(texto, "text")
         
         elif "voice" in message:
             print(f"🎤 [{user_name}] Áudio de voz")
-            send_message(chat_id, "🎤 Áudio recebido! (Transcrição em desenvolvimento)")
+            send_message(chat_id, "🎤 Processando áudio... (aguarde alguns segundos)")
+            
+            # Baixa e transcreve o áudio
+            audio_file_id = message["voice"]["file_id"]
+            transcription = transcribe_telegram_audio(audio_file_id)
+            
+            if transcription:
+                print(f"📝 Transcrição: {transcription}")
+                # Processa transcrição com Claude
+                task_data = process_with_claude(transcription, "voice")
+            else:
+                send_message(chat_id, "❌ Erro ao transcrever áudio. Tente enviar texto!")
         
         elif "audio" in message:
             print(f"🎵 [{user_name}] Arquivo de áudio")
-            send_message(chat_id, "🎵 Arquivo de áudio recebido!")
+            send_message(chat_id, "🎵 Processando arquivo de áudio...")
+            
+            audio_file_id = message["audio"]["file_id"]
+            transcription = transcribe_telegram_audio(audio_file_id)
+            
+            if transcription:
+                task_data = process_with_claude(transcription, "audio")
+            else:
+                send_message(chat_id, "❌ Erro ao transcrever áudio.")
         
         # Se conseguiu extrair tarefa
         if task_data:
             try:
                 task_id = create_clickup_task(task_data)
-                response_text = f"✅ Tarefa criada!\n\n📌 {task_data['name']}"
+                
+                response_text = f"✅ Tarefa criada com sucesso!\n\n📌 {task_data['name']}"
                 if task_data.get("due_date"):
                     response_text += f"\n⏰ Prazo: {task_data['due_date']}"
+                if task_data.get("priority"):
+                    priority_emoji = {"urgent": "🔴", "high": "🟠", "normal": "🟡", "low": "🟢"}.get(task_data["priority"], "")
+                    response_text += f"\n{priority_emoji} Prioridade: {task_data['priority'].upper()}"
                 
                 send_message(chat_id, response_text)
                 print(f"✅ Tarefa criada no ClickUp: {task_id}")
             
             except Exception as e:
                 print(f"❌ Erro ao criar tarefa: {str(e)}")
-                send_message(chat_id, f"❌ Erro: {str(e)}")
+                send_message(chat_id, f"❌ Erro ao criar tarefa: {str(e)}")
         
         return jsonify({"ok": True})
     
@@ -121,8 +153,120 @@ def get_webhook_info():
 
 # ==================== FUNÇÕES ====================
 
-def parse_message(texto):
-    """Parse da mensagem para extrair dados da tarefa"""
+def transcribe_telegram_audio(file_id):
+    """Transcreve áudio do Telegram usando Whisper (OpenAI)"""
+    try:
+        if not OPENAI_API_KEY:
+            print("⚠️ OpenAI API key não configurada!")
+            return None
+        
+        # Obtém o arquivo de áudio do Telegram
+        file_info_url = f"{TELEGRAM_API}/getFile"
+        response = requests.post(file_info_url, data={"file_id": file_id})
+        file_info = response.json()
+        
+        if not file_info.get("ok"):
+            print("Erro ao obter arquivo do Telegram")
+            return None
+        
+        file_path = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        
+        # Baixa o arquivo
+        audio_response = requests.get(file_url)
+        audio_file = BytesIO(audio_response.content)
+        audio_file.name = "audio.ogg"
+        
+        # Envia para Whisper (OpenAI)
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        files = {
+            "file": ("audio.ogg", audio_file, "audio/ogg"),
+            "model": (None, "whisper-1")
+        }
+        
+        whisper_response = requests.post(WHISPER_URL, headers=headers, files=files)
+        
+        if whisper_response.status_code == 200:
+            transcription = whisper_response.json().get("text", "")
+            print(f"✅ Áudio transcrito com sucesso: {transcription}")
+            return transcription
+        else:
+            print(f"Erro Whisper: {whisper_response.text}")
+            return None
+    
+    except Exception as e:
+        print(f"Erro ao transcrever áudio: {str(e)}")
+        return None
+
+def process_with_claude(texto, source_type="text"):
+    """Processa o texto com Claude para extrair dados da tarefa"""
+    try:
+        if not CLAUDE_API_KEY:
+            print("⚠️ Claude API key não configurada!")
+            return parse_message_simple(texto)
+        
+        # Prepara o prompt para Claude
+        prompt = f"""
+Você é um assistente de gerenciamento de tarefas. Analise a seguinte mensagem e extraia as informações da tarefa.
+
+Mensagem (tipo: {source_type}): "{texto}"
+
+Retorne um JSON com os seguintes campos:
+- name: Nome/descrição da tarefa (máximo 100 caracteres, sem emojis no início)
+- due_date: Data de vencimento em formato YYYY-MM-DD (extraia de "hoje", "amanhã", "próxima segunda", etc. ou deixe null)
+- priority: Prioridade ('urgent', 'high', 'normal', 'low' - baseado em palavras como "urgente", "importante", etc.)
+- description: Descrição detalhada (máximo 200 caracteres)
+
+Seja inteligente na interpretação. Se o usuário fala "cotar Enscape", entenda como "Cotar Enscape (hardware/software)".
+
+Retorne APENAS o JSON, sem markdown.
+"""
+        
+        response = requests.post(
+            CLAUDE_API_URL,
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-opus-4-20250805",
+                "max_tokens": 500,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            }
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            content = result["content"][0]["text"]
+            
+            # Parse JSON response
+            task_data = json.loads(content)
+            
+            # Adiciona emoji ao nome se não tiver
+            if task_data.get("name") and not has_emoji(task_data["name"]):
+                task_data["name"] = "📋 " + task_data["name"]
+            
+            print(f"✅ Claude processou: {task_data}")
+            return task_data
+        else:
+            print(f"Erro Claude: {response.text}")
+            return parse_message_simple(texto)
+    
+    except Exception as e:
+        print(f"Erro ao processar com Claude: {str(e)}")
+        return parse_message_simple(texto)
+
+def parse_message_simple(texto):
+    """Fallback: Parse simples da mensagem"""
     if not texto or len(texto.strip()) == 0:
         return None
     
@@ -133,42 +277,24 @@ def parse_message(texto):
         "description": ""
     }
     
-    # Detecta prioridade
     texto_lower = texto.lower()
     
     if any(word in texto_lower for word in ["urgente", "urgencia", "asap"]):
         task_data["priority"] = "urgent"
-        task_data["name"] = remove_words(texto, ["urgente", "urgencia", "asap"])
     elif any(word in texto_lower for word in ["importante", "alta", "high"]):
         task_data["priority"] = "high"
-        task_data["name"] = remove_words(texto, ["importante", "alta", "high"])
     
-    # Detecta datas
     if any(word in texto_lower for word in ["hoje", "today"]):
         task_data["due_date"] = get_today_date()
-        task_data["name"] = remove_words(texto, ["hoje", "today"])
     elif any(word in texto_lower for word in ["amanhã", "tomorrow"]):
         task_data["due_date"] = get_tomorrow_date()
-        task_data["name"] = remove_words(texto, ["amanhã", "tomorrow"])
     elif any(word in texto_lower for word in ["próxima segunda", "segunda", "monday"]):
         task_data["due_date"] = get_next_monday()
-        task_data["name"] = remove_words(texto, ["próxima segunda", "segunda", "monday"])
     
-    # Limpa nome
-    task_data["name"] = task_data["name"].strip()
-    
-    # Adiciona emoji se não tiver
     if not has_emoji(task_data["name"]):
         task_data["name"] = "📋 " + task_data["name"]
     
     return task_data
-
-def remove_words(texto, words):
-    """Remove palavras do texto"""
-    result = texto
-    for word in words:
-        result = result.replace(word, "").replace(word.upper(), "")
-    return result.strip()
 
 def has_emoji(text):
     """Verifica se texto tem emoji"""
@@ -210,7 +336,10 @@ def send_message(chat_id, text):
 def create_clickup_task(task_data):
     """Cria tarefa no ClickUp"""
     if not CLICKUP_TOKEN:
-        raise Exception("❌ Token ClickUp não configurado! Adicione via variável CLICKUP_TOKEN")
+        raise Exception("❌ Token ClickUp não configurado!")
+    
+    # Remove "Bearer" se foi adicionado
+    token = CLICKUP_TOKEN.replace("Bearer ", "").strip()
     
     url = f"{CLICKUP_API}/list/{CLICKUP_LIST_ID}/task"
     
@@ -219,19 +348,17 @@ def create_clickup_task(task_data):
         "description": task_data.get("description", ""),
     }
     
-    # Adiciona prioridade se tiver
     if task_data.get("priority") == "urgent":
         payload["priority"] = 1
     elif task_data.get("priority") == "high":
         payload["priority"] = 2
     
-    # Adiciona data se tiver
     if task_data.get("due_date"):
         due_date_obj = datetime.strptime(task_data["due_date"], "%Y-%m-%d")
         payload["due_date"] = int(due_date_obj.timestamp() * 1000)
     
     headers = {
-        "Authorization": CLICKUP_TOKEN,
+        "Authorization": token,
         "Content-Type": "application/json"
     }
     
@@ -251,14 +378,13 @@ if __name__ == "__main__":
     
     print("""
 ╔════════════════════════════════════════════════════════════╗
-║         🤖 AUTOMAÇÃO TELEGRAM → CLICKUP                   ║
-║              Rodando no Render.com                         ║
+║    🤖 AUTOMAÇÃO COM IA AVANÇADA                           ║
+║  Telegram → Claude (IA) → ClickUp                         ║
 ╠════════════════════════════════════════════════════════════╣
 ║                                                            ║
-║  Bot Telegram: @promavassistente_bot                      ║
-║  Webhook: /webhook                                        ║
-║  Status: /                                                ║
-║  Setup: /setup_webhook                                   ║
+║  ✨ Transcrição Inteligente (Whisper)                     ║
+║  ✨ Análise com Claude (compreensão)                      ║
+║  ✨ Tarefas Precisas no ClickUp                           ║
 ║                                                            ║
 ╚════════════════════════════════════════════════════════════╝
 """)
