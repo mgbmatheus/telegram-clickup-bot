@@ -576,4 +576,3 @@ if __name__ == "__main__":
     print(f"Modelo Claude: {CLAUDE_MODEL}")
     print(f"ClickUp List: {CLICKUP_LIST_ID}")
     app.run(host="0.0.0.0", port=port, debug=False)
-```
