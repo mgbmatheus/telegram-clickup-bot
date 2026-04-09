@@ -1,337 +1,579 @@
 """
-Servidor Webhook Telegram → AssemblyAI (Transcrição) → Claude → ClickUp
-VERSÃO FINAL COM ASSEMBLYAI FUNCIONANDO 100%
+Servidor Webhook Telegram -> AssemblyAI (Transcricao) -> Claude -> ClickUp
+VERSAO FINAL REVISADA
 """
 
 import os
 import json
+import re
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
-from io import BytesIO
 import time
+import threading
 
 app = Flask(__name__)
 
-# ==================== CONFIGURAÇÕES ====================
-TELEGRAM_TOKEN = "8070425563:AAHohccqjyZ9nBTiJ4OtczjHo6-OKRobYjg"
+# ==================== CONFIGURACOES ====================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ClickUp
 CLICKUP_TOKEN = os.environ.get("CLICKUP_TOKEN", "")
-CLICKUP_LIST_ID = "901113530854"
+CLICKUP_LIST_ID = os.environ.get("CLICKUP_LIST_ID", "901113530854")
 CLICKUP_API = "https://api.clickup.com/api/v2"
 
-# Claude API
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
-# AssemblyAI
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
 ASSEMBLYAI_URL = "https://api.assemblyai.com/v2"
 
-# Webhook URL
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
+
+DIAS_SEMANA = {
+    0: "segunda-feira",
+    1: "terca-feira",
+    2: "quarta-feira",
+    3: "quinta-feira",
+    4: "sexta-feira",
+    5: "sabado",
+    6: "domingo",
+}
+
 
 # ==================== ROTAS ====================
 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
-        "status": "🟢 OK",
-        "service": "Telegram → AssemblyAI → Claude → ClickUp",
-        "timestamp": datetime.now().isoformat()
+        "status": "OK",
+        "service": "Telegram > AssemblyAI > Claude > ClickUp",
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "telegram": "ok" if TELEGRAM_TOKEN else "missing",
+            "clickup": "ok" if CLICKUP_TOKEN else "missing",
+            "claude": "ok" if CLAUDE_API_KEY else "missing",
+            "assemblyai": "ok" if ASSEMBLYAI_API_KEY else "missing",
+            "model": CLAUDE_MODEL,
+            "clickup_list": CLICKUP_LIST_ID,
+        }
     })
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Recebe updates do Telegram"""
     try:
         data = request.get_json()
-        
+
         if not data or "message" not in data:
             return jsonify({"ok": True})
-        
+
         message = data["message"]
         chat_id = message.get("chat", {}).get("id")
-        user_name = message.get("from", {}).get("first_name", "Usuário")
-        
+        user_name = message.get("from", {}).get("first_name", "Usuario")
+
         if not chat_id:
             return jsonify({"ok": True})
-        
-        # Processa texto
-        if "text" in message:
-            texto = message["text"]
-            print(f"📝 [{user_name}] Texto: {texto}")
-            task_data = process_with_claude(texto, "text")
-        
-        # Processa áudio
-        elif "voice" in message or "audio" in message:
-            print(f"🎤 [{user_name}] Áudio")
-            send_message(chat_id, "🎤 Transcrevendo áudio com AssemblyAI... aguarde...")
-            
-            # Obtém arquivo
-            file_id = message.get("voice", {}).get("file_id") or message.get("audio", {}).get("file_id")
-            
-            # Transcreve com AssemblyAI
-            transcription = transcribe_with_assemblyai(file_id, chat_id)
-            
-            if transcription and transcription.strip():
-                print(f"✅ Transcrição: {transcription}")
-                task_data = process_with_claude(transcription, "voice")
-            else:
-                send_message(chat_id, "❌ Erro ao transcrever áudio. Tente novamente!")
-                return jsonify({"ok": True})
-        else:
-            return jsonify({"ok": True})
-        
-        # Cria tarefa
-        if task_data:
-            try:
-                task_id = create_clickup_task(task_data)
-                
-                response_text = f"✅ Tarefa criada!\n\n📌 {task_data['name']}"
-                if task_data.get("due_date"):
-                    response_text += f"\n⏰ Prazo: {task_data['due_date']}"
-                if task_data.get("priority"):
-                    priority_emoji = {"urgent": "🔴", "high": "🟠"}.get(task_data["priority"], "")
-                    response_text += f"\n{priority_emoji} Prioridade: {task_data['priority'].upper()}"
-                
-                send_message(chat_id, response_text)
-                print(f"✅ Tarefa criada: {task_id}")
-            
-            except Exception as e:
-                print(f"❌ Erro: {str(e)}")
-                send_message(chat_id, f"❌ Erro: {str(e)}")
-        
+
+        thread = threading.Thread(
+            target=process_message,
+            args=(message, chat_id, user_name),
+            daemon=True,
+        )
+        thread.start()
+
         return jsonify({"ok": True})
-    
+
     except Exception as e:
-        print(f"❌ Erro no webhook: {str(e)}")
+        print(f"[ERRO] webhook: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/setup_webhook", methods=["GET"])
 def setup_webhook():
     try:
         webhook_url = f"{WEBHOOK_URL}/webhook"
-        url = f"{TELEGRAM_API}/setWebhook"
-        response = requests.post(url, json={"url": webhook_url})
-        return jsonify(response.json())
+        response = requests.post(
+            f"{TELEGRAM_API}/setWebhook",
+            json={"url": webhook_url, "allowed_updates": ["message"]},
+            timeout=10,
+        )
+        result = response.json()
+        print(f"[INFO] Webhook setup: {result}")
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== FUNÇÕES ====================
 
-def transcribe_with_assemblyai(file_id, chat_id):
-    """Transcreve áudio com AssemblyAI"""
+# ==================== PROCESSAMENTO ====================
+
+def process_message(message, chat_id, user_name):
+    try:
+        if "text" in message:
+            texto = message["text"].strip()
+
+            if texto.startswith("/"):
+                handle_command(texto, chat_id)
+                return
+
+            if len(texto) < 3:
+                return
+
+            print(f"[TEXT] [{user_name}] {texto}")
+            task_data = process_with_claude(texto)
+
+        elif "voice" in message or "audio" in message:
+            print(f"[AUDIO] [{user_name}] Audio recebido")
+            send_message(chat_id, "Transcrevendo audio... aguarde")
+
+            file_id = (
+                message.get("voice", {}).get("file_id")
+                or message.get("audio", {}).get("file_id")
+            )
+
+            if not file_id:
+                send_message(chat_id, "Erro: nao consegui obter o arquivo de audio.")
+                return
+
+            transcription = transcribe_with_assemblyai(file_id)
+
+            if not transcription or not transcription.strip():
+                send_message(
+                    chat_id,
+                    "Nao consegui transcrever o audio. Tente novamente ou envie como texto.",
+                )
+                return
+
+            print(f"[TRANSCRICAO] {transcription}")
+            send_message(chat_id, f'Transcricao: "{transcription}"')
+            task_data = process_with_claude(transcription)
+
+        else:
+            return
+
+        if not task_data:
+            send_message(chat_id, "Nao consegui interpretar a mensagem como tarefa.")
+            return
+
+        task_id, task_url = create_clickup_task(task_data)
+
+        lines = ["Tarefa criada no ClickUp!", ""]
+        lines.append(f"Nome: {task_data['name']}")
+
+        if task_data.get("description"):
+            desc = task_data["description"]
+            if len(desc) > 120:
+                desc = desc[:120] + "..."
+            lines.append(f"Descricao: {desc}")
+
+        if task_data.get("due_date"):
+            try:
+                dt = datetime.strptime(task_data["due_date"], "%Y-%m-%d")
+                lines.append(f"Prazo: {dt.strftime('%d/%m/%Y')}")
+            except ValueError:
+                lines.append(f"Prazo: {task_data['due_date']}")
+
+        if task_data.get("priority"):
+            labels = {
+                "urgent": "URGENTE",
+                "high": "ALTA",
+                "normal": "NORMAL",
+                "low": "BAIXA",
+            }
+            lines.append(f"Prioridade: {labels.get(task_data['priority'], task_data['priority'])}")
+
+        if task_url:
+            lines.append(f"\nLink: {task_url}")
+
+        send_message(chat_id, "\n".join(lines))
+        print(f"[OK] Tarefa criada: {task_id}")
+
+    except Exception as e:
+        print(f"[ERRO] process_message: {e}")
+        send_message(chat_id, f"Erro ao criar tarefa: {str(e)}")
+
+
+def handle_command(text, chat_id):
+    cmd = text.lower().split()[0]
+    if cmd == "/start":
+        send_message(
+            chat_id,
+            "Ola! Eu crio tarefas no ClickUp.\n\n"
+            "Envie um texto ou um audio descrevendo a tarefa.\n\n"
+            "Exemplos:\n"
+            '- "Revisar contrato ate sexta, urgente"\n'
+            '- "Criar landing page para o produto novo"\n'
+            "- Envie um audio descrevendo a tarefa",
+        )
+    elif cmd == "/help":
+        send_message(
+            chat_id,
+            "Como usar:\n\n"
+            "1. Envie texto ou audio com a tarefa\n"
+            "2. Eu interpreto nome, prazo e prioridade\n"
+            "3. Crio automaticamente no ClickUp\n\n"
+            "Dicas:\n"
+            '- Mencione datas: "ate amanha", "para sexta"\n'
+            '- Mencione prioridade: "urgente", "importante"\n'
+            "- Seja especifico na descricao",
+        )
+    else:
+        send_message(chat_id, "Comando nao reconhecido. Use /start ou /help")
+
+
+# ==================== TRANSCRICAO ====================
+
+def transcribe_with_assemblyai(file_id):
     try:
         if not ASSEMBLYAI_API_KEY:
-            print("❌ AssemblyAI API key não configurada!")
+            print("[ERRO] ASSEMBLYAI_API_KEY nao configurada")
             return None
-        
-        # Obtém arquivo do Telegram
-        file_info_url = f"{TELEGRAM_API}/getFile"
-        response = requests.post(file_info_url, data={"file_id": file_id})
-        file_info = response.json()
-        
+
+        resp = requests.post(
+            f"{TELEGRAM_API}/getFile",
+            json={"file_id": file_id},
+            timeout=10,
+        )
+        file_info = resp.json()
+
         if not file_info.get("ok"):
-            print("Erro ao obter arquivo do Telegram")
+            print(f"[ERRO] getFile: {file_info}")
             return None
-        
+
         file_path = file_info["result"]["file_path"]
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-        
-        # Baixa o arquivo de áudio
-        print(f"📥 Baixando áudio de: {file_url}")
-        audio_response = requests.get(file_url)
-        
-        # Upload para AssemblyAI
-        print("📤 Enviando para AssemblyAI...")
-        headers = {"Authorization": ASSEMBLYAI_API_KEY}
-        
-        upload_response = requests.post(
+
+        print("[INFO] Baixando audio do Telegram...")
+        audio_resp = requests.get(file_url, timeout=30)
+        if audio_resp.status_code != 200:
+            print(f"[ERRO] Download audio: HTTP {audio_resp.status_code}")
+            return None
+
+        audio_bytes = audio_resp.content
+        if len(audio_bytes) == 0:
+            print("[ERRO] Audio vazio")
+            return None
+
+        print(f"[INFO] Audio baixado: {len(audio_bytes)} bytes")
+
+        print("[INFO] Upload para AssemblyAI...")
+        aai_headers = {"Authorization": ASSEMBLYAI_API_KEY}
+
+        upload_resp = requests.post(
             f"{ASSEMBLYAI_URL}/upload",
-            headers=headers,
-            data=audio_response.content
+            headers=aai_headers,
+            data=audio_bytes,
+            timeout=60,
         )
-        
-        if upload_response.status_code != 200:
-            print(f"Erro ao fazer upload: {upload_response.text}")
+
+        if upload_resp.status_code != 200:
+            print(f"[ERRO] Upload AssemblyAI: {upload_resp.status_code} {upload_resp.text}")
             return None
-        
-        audio_url = upload_response.json()["upload_url"]
-        print(f"✅ Upload concluído: {audio_url}")
-        
-        # Submete transcrição
-        print("🎙️ Submetendo para transcrição...")
-        transcription_response = requests.post(
+
+        audio_url = upload_resp.json().get("upload_url")
+        if not audio_url:
+            print("[ERRO] upload_url nao retornado")
+            return None
+
+        print("[INFO] Upload OK")
+
+        print("[INFO] Submetendo transcricao...")
+        transcript_resp = requests.post(
             f"{ASSEMBLYAI_URL}/transcript",
-            headers=headers,
-            json={"audio_url": audio_url, "language_code": "pt"}
+            headers=aai_headers,
+            json={"audio_url": audio_url, "language_code": "pt"},
+            timeout=30,
         )
-        
-        if transcription_response.status_code != 200:
-            print(f"Erro ao submeter: {transcription_response.text}")
+
+        if transcript_resp.status_code != 200:
+            print(f"[ERRO] Submeter transcricao: {transcript_resp.text}")
             return None
-        
-        transcript_id = transcription_response.json()["id"]
-        print(f"📝 ID da transcrição: {transcript_id}")
-        
-        # Aguarda transcrição
-        print("⏳ Aguardando transcrição...")
-        max_attempts = 60  # 2 minutos
-        attempt = 0
-        
-        while attempt < max_attempts:
-            result_response = requests.get(
+
+        transcript_id = transcript_resp.json().get("id")
+        if not transcript_id:
+            print("[ERRO] transcript id nao retornado")
+            return None
+
+        print(f"[INFO] Transcricao ID: {transcript_id}")
+
+        print("[INFO] Aguardando transcricao...")
+        for attempt in range(60):
+            result_resp = requests.get(
                 f"{ASSEMBLYAI_URL}/transcript/{transcript_id}",
-                headers=headers
+                headers=aai_headers,
+                timeout=10,
             )
-            
-            result = result_response.json()
+
+            if result_resp.status_code != 200:
+                print(f"[WARN] Polling HTTP {result_resp.status_code}")
+                time.sleep(2)
+                continue
+
+            result = result_resp.json()
             status = result.get("status")
-            
-            print(f"Status: {status}")
-            
+
             if status == "completed":
                 text = result.get("text", "").strip()
-                print(f"✅ Transcrição completa: {text}")
-                return text
-            
+                print(f"[OK] Transcricao completa: {len(text)} chars")
+                return text if text else None
+
             elif status == "error":
-                print(f"Erro na transcrição: {result.get('error')}")
+                error_msg = result.get("error", "desconhecido")
+                print(f"[ERRO] Transcricao falhou: {error_msg}")
                 return None
-            
-            # Aguarda 2 segundos antes de tentar novamente
+
             time.sleep(2)
-            attempt += 1
-        
-        print("Timeout na transcrição")
-        return None
-    
-    except Exception as e:
-        print(f"Erro ao transcrever: {str(e)}")
+
+        print("[ERRO] Timeout na transcricao (2 min)")
         return None
 
-def process_with_claude(texto, source_type="text"):
-    """Processa com Claude"""
+    except requests.exceptions.Timeout:
+        print("[ERRO] Timeout na requisicao HTTP")
+        return None
+    except Exception as e:
+        print(f"[ERRO] transcribe_with_assemblyai: {e}")
+        return None
+
+
+# ==================== CLAUDE ====================
+
+def extract_json(text):
+    code_block = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if code_block:
+        text = code_block.group(1)
+
+    text = text.strip()
+
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+
+    if brace_start == -1 or brace_end == -1 or brace_end <= brace_start:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    text = text[brace_start : brace_end + 1]
+    return json.loads(text)
+
+
+def process_with_claude(texto):
     try:
         if not CLAUDE_API_KEY:
+            print("[WARN] CLAUDE_API_KEY ausente, usando parse simples")
             return parse_simple(texto)
-        
-        prompt = f"""
-Você é assistente de tarefas. Analise: "{texto}"
 
-Retorne JSON:
-- name: Nome da tarefa (máximo 100 chars)
-- description: Descrição (máximo 200 chars)
-- due_date: Data YYYY-MM-DD ou null
-- priority: 'urgent', 'high', 'normal', 'low'
+        agora = datetime.now()
+        hoje = agora.strftime("%Y-%m-%d")
+        dia_semana = DIAS_SEMANA.get(agora.weekday(), "")
 
-Retorne APENAS JSON.
-"""
-        
+        prompt = f"""Voce e um assistente que extrai tarefas de mensagens em portugues.
+Data de hoje: {hoje} ({dia_semana}).
+
+Analise a mensagem abaixo e extraia as informacoes da tarefa.
+
+Mensagem: "{texto}"
+
+Retorne APENAS um objeto JSON (sem markdown, sem explicacao, sem texto extra) com:
+{{
+  "name": "nome curto e claro da tarefa (max 80 caracteres)",
+  "description": "descricao detalhada se houver contexto extra, senao string vazia",
+  "due_date": "YYYY-MM-DD se mencionou prazo, senao null",
+  "priority": "urgent ou high ou normal ou low"
+}}
+
+Regras para datas:
+- "hoje" = {hoje}
+- "amanha" = proximo dia
+- "sexta", "segunda", etc = proxima ocorrencia a partir de hoje
+- "semana que vem" = proxima segunda-feira
+- Se nao mencionou data = null
+
+Regras para prioridade:
+- "urgente", "asap", "imediato", "agora" = urgent
+- "importante", "prioridade alta" = high
+- Sem indicacao de urgencia = normal
+- "baixa prioridade", "quando puder" = low
+
+Retorne SOMENTE o JSON, nada mais."""
+
         response = requests.post(
             CLAUDE_API_URL,
             headers={
                 "x-api-key": CLAUDE_API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
+                "content-type": "application/json",
             },
             json={
-                "model": "claude-opus-4-20250805",
-                "max_tokens": 500,
-                "messages": [{"role": "user", "content": prompt}]
-            }
+                "model": CLAUDE_MODEL,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
         )
-        
-        if response.status_code == 200:
-            result = response.json()
-            content = result["content"][0]["text"]
-            task_data = json.loads(content)
-            
-            if task_data.get("name") and not has_emoji(task_data["name"]):
-                task_data["name"] = "📋 " + task_data["name"]
-            
-            return task_data
-        else:
+
+        if response.status_code != 200:
+            print(f"[WARN] Claude HTTP {response.status_code}: {response.text[:200]}")
             return parse_simple(texto)
-    
+
+        result = response.json()
+
+        content_blocks = result.get("content", [])
+        if not content_blocks:
+            print("[WARN] Claude retornou content vazio")
+            return parse_simple(texto)
+
+        content = content_blocks[0].get("text", "")
+        if not content.strip():
+            print("[WARN] Claude retornou texto vazio")
+            return parse_simple(texto)
+
+        task_data = extract_json(content)
+
+        if not isinstance(task_data, dict):
+            print("[WARN] Claude nao retornou um dict")
+            return parse_simple(texto)
+
+        if not task_data.get("name"):
+            task_data["name"] = texto[:80]
+
+        if len(task_data["name"]) > 100:
+            task_data["name"] = task_data["name"][:97] + "..."
+
+        task_data.setdefault("description", "")
+        task_data.setdefault("due_date", None)
+        task_data.setdefault("priority", "normal")
+
+        valid_priorities = {"urgent", "high", "normal", "low"}
+        if task_data.get("priority") not in valid_priorities:
+            task_data["priority"] = "normal"
+
+        if task_data.get("due_date"):
+            try:
+                parsed_date = datetime.strptime(task_data["due_date"], "%Y-%m-%d")
+                if parsed_date.date() < datetime.now().date():
+                    print(f"[WARN] Data no passado ignorada: {task_data['due_date']}")
+                    task_data["due_date"] = None
+            except ValueError:
+                print(f"[WARN] Data invalida: {task_data['due_date']}")
+                task_data["due_date"] = None
+
+        return task_data
+
+    except json.JSONDecodeError as e:
+        print(f"[WARN] JSON parse error: {e}")
+        return parse_simple(texto)
+    except requests.exceptions.Timeout:
+        print("[WARN] Claude timeout")
+        return parse_simple(texto)
     except Exception as e:
-        print(f"Erro Claude: {str(e)}")
+        print(f"[WARN] process_with_claude: {e}")
         return parse_simple(texto)
 
+
 def parse_simple(texto):
-    """Parse simples como fallback"""
-    if not texto or len(texto.strip()) == 0:
+    if not texto or not texto.strip():
         return None
-    
+
+    texto = texto.strip()
     task_data = {
-        "name": texto.strip(),
+        "name": texto[:80],
+        "description": texto if len(texto) > 80 else "",
         "due_date": None,
-        "priority": None,
-        "description": ""
+        "priority": "normal",
     }
-    
+
     texto_lower = texto.lower()
-    
-    if any(word in texto_lower for word in ["urgente", "asap"]):
+
+    if any(w in texto_lower for w in ["urgente", "asap", "imediato", "agora"]):
         task_data["priority"] = "urgent"
-    elif any(word in texto_lower for word in ["importante", "alta"]):
+    elif any(w in texto_lower for w in ["importante", "alta prioridade", "prioridade alta"]):
         task_data["priority"] = "high"
-    
-    if any(word in texto_lower for word in ["hoje"]):
-        task_data["due_date"] = datetime.now().strftime("%Y-%m-%d")
-    elif any(word in texto_lower for word in ["amanhã"]):
-        tomorrow = datetime.now() + timedelta(days=1)
-        task_data["due_date"] = tomorrow.strftime("%Y-%m-%d")
-    
-    if not has_emoji(task_data["name"]):
-        task_data["name"] = "📋 " + task_data["name"]
-    
+    elif any(w in texto_lower for w in ["baixa prioridade", "quando puder"]):
+        task_data["priority"] = "low"
+
+    hoje = datetime.now()
+    if "hoje" in texto_lower:
+        task_data["due_date"] = hoje.strftime("%Y-%m-%d")
+    elif "amanha" in texto_lower or "amanhã" in texto_lower:
+        task_data["due_date"] = (hoje + timedelta(days=1)).strftime("%Y-%m-%d")
+
     return task_data
 
-def has_emoji(text):
-    return any(ord(char) > 127 for char in text)
+
+# ==================== TELEGRAM ====================
 
 def send_message(chat_id, text):
     try:
-        url = f"{TELEGRAM_API}/sendMessage"
-        data = {"chat_id": chat_id, "text": text}
-        requests.post(url, json=data)
-    except:
-        pass
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[WARN] send_message: {e}")
+
+
+# ==================== CLICKUP ====================
+
+PRIORITY_MAP = {
+    "urgent": 1,
+    "high": 2,
+    "normal": 3,
+    "low": 4,
+}
+
 
 def create_clickup_task(task_data):
     if not CLICKUP_TOKEN:
-        raise Exception("Token ClickUp não configurado!")
-    
+        raise Exception("CLICKUP_TOKEN nao configurado!")
+
     token = CLICKUP_TOKEN.replace("Bearer ", "").strip()
     url = f"{CLICKUP_API}/list/{CLICKUP_LIST_ID}/task"
-    
+
     payload = {
-        "name": task_data.get("name", "Tarefa"),
+        "name": task_data.get("name", "Tarefa sem titulo"),
         "description": task_data.get("description", ""),
     }
-    
-    if task_data.get("priority") == "urgent":
-        payload["priority"] = 1
-    elif task_data.get("priority") == "high":
-        payload["priority"] = 2
-    
+
+    priority = task_data.get("priority")
+    if priority in PRIORITY_MAP:
+        payload["priority"] = PRIORITY_MAP[priority]
+
     if task_data.get("due_date"):
-        due_date_obj = datetime.strptime(task_data["due_date"], "%Y-%m-%d")
-        payload["due_date"] = int(due_date_obj.timestamp() * 1000)
-    
-    headers = {"Authorization": token, "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
-    
+        try:
+            due_dt = datetime.strptime(task_data["due_date"], "%Y-%m-%d")
+            due_dt = due_dt.replace(hour=23, minute=59, second=59)
+            payload["due_date"] = int(due_dt.timestamp() * 1000)
+        except ValueError:
+            pass
+
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=15)
+
     if response.status_code != 200:
-        error_data = response.json()
-        raise Exception(f"Erro ClickUp: {error_data.get('err', 'Desconhecido')}")
-    
-    return response.json().get("id")
+        try:
+            error_data = response.json()
+            err_msg = error_data.get("err", error_data.get("error", "Desconhecido"))
+        except Exception:
+            err_msg = f"HTTP {response.status_code}"
+        raise Exception(f"ClickUp API: {err_msg}")
+
+    result = response.json()
+    task_id = result.get("id", "")
+    task_url = result.get("url", "")
+
+    return task_id, task_url
+
+
+# ==================== MAIN ====================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    print(f"Servidor iniciando na porta {port}")
+    print(f"Modelo Claude: {CLAUDE_MODEL}")
+    print(f"ClickUp List: {CLICKUP_LIST_ID}")
     app.run(host="0.0.0.0", port=port, debug=False)
+```
