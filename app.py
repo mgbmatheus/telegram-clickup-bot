@@ -282,7 +282,11 @@ def transcribe_with_assemblyai(file_id):
         transcript_resp = requests.post(
             f"{ASSEMBLYAI_URL}/transcript",
             headers=aai_headers,
-            json={"audio_url": audio_url, "language_code": "pt"},
+            json={
+                "audio_url": audio_url,
+                "language_code": "pt",
+                "speech_model": "universal-2",
+            },
             timeout=30,
         )
 
