@@ -1,6 +1,6 @@
 """
-Servidor Webhook Telegram → Claude → ClickUp
-VERSÃO FINAL SIMPLES - SEM WHISPER, SEM GOOGLE CLOUD
+Servidor Webhook Telegram → AssemblyAI (Transcrição) → Claude → ClickUp
+VERSÃO FINAL COM ASSEMBLYAI FUNCIONANDO 100%
 """
 
 import os
@@ -9,7 +9,7 @@ import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from io import BytesIO
-import base64
+import time
 
 app = Flask(__name__)
 
@@ -26,6 +26,10 @@ CLICKUP_API = "https://api.clickup.com/api/v2"
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
+# AssemblyAI
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
+ASSEMBLYAI_URL = "https://api.assemblyai.com/v2"
+
 # Webhook URL
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
 
@@ -35,7 +39,7 @@ WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
 def health():
     return jsonify({
         "status": "🟢 OK",
-        "service": "Telegram → Claude → ClickUp",
+        "service": "Telegram → AssemblyAI → Claude → ClickUp",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -64,16 +68,19 @@ def webhook():
         # Processa áudio
         elif "voice" in message or "audio" in message:
             print(f"🎤 [{user_name}] Áudio")
-            send_message(chat_id, "🎤 Processando áudio... aguarde...")
+            send_message(chat_id, "🎤 Transcrevendo áudio com AssemblyAI... aguarde...")
             
-            # Obtém o arquivo
+            # Obtém arquivo
             file_id = message.get("voice", {}).get("file_id") or message.get("audio", {}).get("file_id")
-            audio_description = get_audio_description(file_id, chat_id)
             
-            if audio_description:
-                task_data = process_with_claude(audio_description, "voice")
+            # Transcreve com AssemblyAI
+            transcription = transcribe_with_assemblyai(file_id, chat_id)
+            
+            if transcription and transcription.strip():
+                print(f"✅ Transcrição: {transcription}")
+                task_data = process_with_claude(transcription, "voice")
             else:
-                send_message(chat_id, "❌ Não consegui processar o áudio. Tente enviar texto!")
+                send_message(chat_id, "❌ Erro ao transcrever áudio. Tente novamente!")
                 return jsonify({"ok": True})
         else:
             return jsonify({"ok": True})
@@ -115,28 +122,95 @@ def setup_webhook():
 
 # ==================== FUNÇÕES ====================
 
-def get_audio_description(file_id, chat_id):
-    """Obtém descrição do áudio"""
+def transcribe_with_assemblyai(file_id, chat_id):
+    """Transcreve áudio com AssemblyAI"""
     try:
-        # Obtém info do arquivo
+        if not ASSEMBLYAI_API_KEY:
+            print("❌ AssemblyAI API key não configurada!")
+            return None
+        
+        # Obtém arquivo do Telegram
         file_info_url = f"{TELEGRAM_API}/getFile"
         response = requests.post(file_info_url, data={"file_id": file_id})
         file_info = response.json()
         
         if not file_info.get("ok"):
+            print("Erro ao obter arquivo do Telegram")
             return None
         
         file_path = file_info["result"]["file_path"]
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
         
-        # Baixa o arquivo
+        # Baixa o arquivo de áudio
+        print(f"📥 Baixando áudio de: {file_url}")
         audio_response = requests.get(file_url)
         
-        # Envia para Claude analisar
-        return f"[Áudio recebido - {len(audio_response.content)} bytes]"
+        # Upload para AssemblyAI
+        print("📤 Enviando para AssemblyAI...")
+        headers = {"Authorization": ASSEMBLYAI_API_KEY}
+        
+        upload_response = requests.post(
+            f"{ASSEMBLYAI_URL}/upload",
+            headers=headers,
+            data=audio_response.content
+        )
+        
+        if upload_response.status_code != 200:
+            print(f"Erro ao fazer upload: {upload_response.text}")
+            return None
+        
+        audio_url = upload_response.json()["upload_url"]
+        print(f"✅ Upload concluído: {audio_url}")
+        
+        # Submete transcrição
+        print("🎙️ Submetendo para transcrição...")
+        transcription_response = requests.post(
+            f"{ASSEMBLYAI_URL}/transcript",
+            headers=headers,
+            json={"audio_url": audio_url, "language_code": "pt"}
+        )
+        
+        if transcription_response.status_code != 200:
+            print(f"Erro ao submeter: {transcription_response.text}")
+            return None
+        
+        transcript_id = transcription_response.json()["id"]
+        print(f"📝 ID da transcrição: {transcript_id}")
+        
+        # Aguarda transcrição
+        print("⏳ Aguardando transcrição...")
+        max_attempts = 60  # 2 minutos
+        attempt = 0
+        
+        while attempt < max_attempts:
+            result_response = requests.get(
+                f"{ASSEMBLYAI_URL}/transcript/{transcript_id}",
+                headers=headers
+            )
+            
+            result = result_response.json()
+            status = result.get("status")
+            
+            print(f"Status: {status}")
+            
+            if status == "completed":
+                text = result.get("text", "").strip()
+                print(f"✅ Transcrição completa: {text}")
+                return text
+            
+            elif status == "error":
+                print(f"Erro na transcrição: {result.get('error')}")
+                return None
+            
+            # Aguarda 2 segundos antes de tentar novamente
+            time.sleep(2)
+            attempt += 1
+        
+        print("Timeout na transcrição")
+        return None
     
     except Exception as e:
-        print(f"Erro ao processar áudio: {str(e)}")
+        print(f"Erro ao transcrever: {str(e)}")
         return None
 
 def process_with_claude(texto, source_type="text"):
