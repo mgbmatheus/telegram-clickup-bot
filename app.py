@@ -1,6 +1,6 @@
 """
 Servidor Webhook Telegram → Claude (IA) → ClickUp
-Versão Simplificada - SEM Whisper (mais estável)
+Versão CORRIGIDA - Processa Áudio com Precisão
 """
 
 import os
@@ -8,6 +8,7 @@ import json
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -24,6 +25,10 @@ CLICKUP_API = "https://api.clickup.com/api/v2"
 # Claude API
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+
+# OpenAI (para Whisper)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 # Webhook URL
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
@@ -66,32 +71,52 @@ def webhook():
         
         elif "voice" in message:
             print(f"🎤 [{user_name}] Áudio de voz")
-            send_message(chat_id, "🎤 Áudio recebido! Processando com IA...")
-            task_data = process_with_claude("[Áudio recebido]", "voice")
+            send_message(chat_id, "🎤 Processando áudio... aguarde alguns segundos...")
+            
+            # Transcreve o áudio
+            audio_file_id = message["voice"]["file_id"]
+            transcription = transcribe_audio(audio_file_id)
+            
+            if transcription and transcription.strip():
+                print(f"✅ Áudio transcrito: {transcription}")
+                task_data = process_with_claude(transcription, "voice")
+            else:
+                send_message(chat_id, "❌ Não consegui transcrever o áudio. Tente enviar texto!")
+                return jsonify({"ok": True})
         
         elif "audio" in message:
             print(f"🎵 [{user_name}] Arquivo de áudio")
-            send_message(chat_id, "🎵 Arquivo de áudio recebido!")
-            task_data = process_with_claude("[Arquivo de áudio]", "audio")
+            send_message(chat_id, "🎵 Processando arquivo de áudio...")
+            
+            audio_file_id = message["audio"]["file_id"]
+            transcription = transcribe_audio(audio_file_id)
+            
+            if transcription and transcription.strip():
+                task_data = process_with_claude(transcription, "audio")
+            else:
+                send_message(chat_id, "❌ Não consegui processar o arquivo de áudio.")
+                return jsonify({"ok": True})
         
         # Se conseguiu extrair tarefa
         if task_data:
             try:
                 task_id = create_clickup_task(task_data)
                 
-                response_text = f"✅ Tarefa criada!\n\n📌 {task_data['name']}"
+                response_text = f"✅ Tarefa criada com sucesso!\n\n📌 {task_data['name']}"
                 if task_data.get("due_date"):
                     response_text += f"\n⏰ Prazo: {task_data['due_date']}"
                 if task_data.get("priority"):
                     priority_emoji = {"urgent": "🔴", "high": "🟠", "normal": "🟡", "low": "🟢"}.get(task_data["priority"], "")
                     response_text += f"\n{priority_emoji} Prioridade: {task_data['priority'].upper()}"
+                if task_data.get("description"):
+                    response_text += f"\n📝 Descrição: {task_data['description']}"
                 
                 send_message(chat_id, response_text)
                 print(f"✅ Tarefa criada no ClickUp: {task_id}")
             
             except Exception as e:
                 print(f"❌ Erro ao criar tarefa: {str(e)}")
-                send_message(chat_id, f"❌ Erro: {str(e)}")
+                send_message(chat_id, f"❌ Erro ao criar tarefa: {str(e)}")
         
         return jsonify({"ok": True})
     
@@ -128,6 +153,58 @@ def get_webhook_info():
 
 # ==================== FUNÇÕES ====================
 
+def transcribe_audio(file_id):
+    """Transcreve áudio do Telegram usando Whisper (OpenAI)"""
+    try:
+        if not OPENAI_API_KEY:
+            print("⚠️ OpenAI API key não configurada!")
+            return None
+        
+        # Obtém o arquivo de áudio do Telegram
+        file_info_url = f"{TELEGRAM_API}/getFile"
+        response = requests.post(file_info_url, data={"file_id": file_id})
+        file_info = response.json()
+        
+        if not file_info.get("ok"):
+            print("Erro ao obter arquivo do Telegram")
+            return None
+        
+        file_path = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        
+        # Baixa o arquivo
+        audio_response = requests.get(file_url)
+        audio_file = BytesIO(audio_response.content)
+        audio_file.name = "audio.ogg"
+        
+        # Envia para Whisper (OpenAI)
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        files = {
+            "file": ("audio.ogg", audio_file, "audio/ogg"),
+            "model": (None, "whisper-1")
+        }
+        
+        whisper_response = requests.post(WHISPER_URL, headers=headers, files=files)
+        
+        if whisper_response.status_code == 200:
+            transcription = whisper_response.json().get("text", "").strip()
+            if transcription:
+                print(f"✅ Áudio transcrito: {transcription}")
+                return transcription
+            else:
+                print("Áudio vazio ou não transcrito")
+                return None
+        else:
+            print(f"Erro Whisper ({whisper_response.status_code}): {whisper_response.text}")
+            return None
+    
+    except Exception as e:
+        print(f"Erro ao transcrever áudio: {str(e)}")
+        return None
+
 def process_with_claude(texto, source_type="text"):
     """Processa o texto com Claude para extrair dados da tarefa"""
     try:
@@ -135,18 +212,27 @@ def process_with_claude(texto, source_type="text"):
             print("⚠️ Claude API key não configurada!")
             return parse_message_simple(texto)
         
+        if not texto or len(texto.strip()) == 0:
+            return None
+        
         prompt = f"""
 Você é um assistente de gerenciamento de tarefas. Analise a seguinte mensagem e extraia as informações da tarefa.
 
 Mensagem (tipo: {source_type}): "{texto}"
 
 Retorne um JSON com os seguintes campos:
-- name: Nome/descrição da tarefa (máximo 100 caracteres, sem emojis)
+- name: Nome/descrição da tarefa (máximo 100 caracteres, claro e objetivo)
+- description: Descrição detalhada (máximo 200 caracteres)
 - due_date: Data em formato YYYY-MM-DD (extraia de "hoje", "amanhã", "segunda", etc. ou null)
-- priority: Prioridade ('urgent', 'high', 'normal', 'low')
-- description: Descrição (máximo 200 caracteres)
+- priority: Prioridade ('urgent', 'high', 'normal', 'low' - baseado em palavras como "urgente", "importante")
 
-Retorne APENAS o JSON.
+IMPORTANTE: Se o usuário disse algo no áudio, CAPTURE EXATAMENTE O QUE ELE PEDIU.
+
+Exemplo:
+Entrada: "Fazer orçamento hoje às 22h"
+Saída: {"name": "Fazer orçamento", "description": "Orçamento para completar até as 22h", "due_date": "2026-04-06", "priority": "normal"}
+
+Retorne APENAS o JSON, sem markdown.
 """
         
         response = requests.post(
@@ -243,7 +329,7 @@ def send_message(chat_id, text):
         return None
 
 def create_clickup_task(task_data):
-    """Cria tarefa no ClickUp"""
+    """Cria tarefa no ClickUp com DESCRIÇÃO"""
     if not CLICKUP_TOKEN:
         raise Exception("❌ Token ClickUp não configurado!")
     
@@ -251,7 +337,7 @@ def create_clickup_task(task_data):
     url = f"{CLICKUP_API}/list/{CLICKUP_LIST_ID}/task"
     
     payload = {
-        "name": task_data["name"],
+        "name": task_data.get("name", "Sem título"),
         "description": task_data.get("description", ""),
     }
     
@@ -265,6 +351,8 @@ def create_clickup_task(task_data):
         payload["due_date"] = int(due_date_obj.timestamp() * 1000)
     
     headers = {"Authorization": token, "Content-Type": "application/json"}
+    
+    print(f"📤 Enviando para ClickUp: {payload}")
     response = requests.post(url, json=payload, headers=headers)
     
     if response.status_code != 200:
@@ -276,5 +364,5 @@ def create_clickup_task(task_data):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("🤖 Servidor Telegram → ClickUp Rodando!")
+    print("🤖 Servidor com Processamento Completo de Áudio Rodando!")
     app.run(host="0.0.0.0", port=port, debug=False)
